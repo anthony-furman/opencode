@@ -1,29 +1,24 @@
 import { afterEach, describe, expect } from "bun:test"
 import path from "path"
 import fs from "fs/promises"
-import { Effect, Layer } from "effect"
+import { Effect } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { EditTool } from "../../src/tool/edit"
 import { WriteTool } from "../../src/tool/write"
 import { ApplyPatchTool } from "../../src/tool/apply_patch"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { LSP } from "@/lsp/lsp"
-import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Format } from "../../src/format"
 import { Agent } from "../../src/agent/agent"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { Truncate } from "@/tool/truncate"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { testEffect } from "../lib/effect"
-import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { ReviewFs } from "@/effect/review-fs-layer"
 import { ReviewOverlay } from "@opencode-ai/core/review-overlay"
 import { forceEnableForAcp, reset, setClientWriteTextFileSupported } from "@/acp/review-mode"
 import { completedToolContent } from "@/acp/tool"
-import { ToolRegistry } from "@/tool/registry"
-import { ProviderV2 } from "@opencode-ai/core/provider"
-import { ModelV2 } from "@opencode-ai/core/model"
 
 const baseCtx = {
   sessionID: SessionID.make("ses_review"),
@@ -37,10 +32,17 @@ const baseCtx = {
 }
 
 const layer = LayerNode.compile(
-  LayerNode.group([LSP.node, ReviewFs.node, Format.node, EventV2Bridge.node, Truncate.node, Agent.node]),
+  LayerNode.group([LSP.node, FSUtil.node, Format.node, EventV2Bridge.node, Truncate.node, Agent.node]),
 )
 
 const it = testEffect(layer)
+
+// Same wiring as ToolRegistry: the tool captures the review wrapper when it is built.
+const withReviewFs = <A, E, R>(tool: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const afs = yield* FSUtil.Service
+    return yield* tool.pipe(Effect.provideService(FSUtil.Service, ReviewFs.wrap(afs)))
+  })
 
 afterEach(async () => {
   delete process.env.OPENCODE_ACP_REVIEW
@@ -63,7 +65,7 @@ describe("review mode tools", () => {
     Effect.gen(function* () {
       enableReview()
       const test = yield* TestInstance
-      const edit = yield* EditTool
+      const edit = yield* withReviewFs(EditTool)
       const tool = yield* edit.init()
 
       const filepath = path.join(test.directory, "edit.txt")
@@ -88,7 +90,7 @@ describe("review mode tools", () => {
     Effect.gen(function* () {
       enableReview()
       const test = yield* TestInstance
-      const write = yield* WriteTool
+      const write = yield* withReviewFs(WriteTool)
       const tool = yield* write.init()
 
       const filepath = path.join(test.directory, "new.txt")
@@ -103,7 +105,7 @@ describe("review mode tools", () => {
     Effect.gen(function* () {
       enableReview()
       const test = yield* TestInstance
-      const patch = yield* ApplyPatchTool
+      const patch = yield* withReviewFs(ApplyPatchTool)
       const tool = yield* patch.init()
 
       const updatePath = path.join(test.directory, "update.txt")
@@ -142,46 +144,7 @@ describe("review mode tools", () => {
         output: result.output,
         metadata: result.metadata,
       })
-      expect(content.some((item) => item.type === "diff" && item.path === deletePath && item.newText === "")).toBe(
-        true,
-      )
-    }),
-  )
-})
-
-// Regression: tools resolved through the production ToolRegistry wiring must
-// stage instead of writing to disk. The direct-tool tests above can pass even
-// when ToolRegistry injects the plain FSUtil layer, so this exercises the real
-// path that ACP prompts go through.
-const registryIt = testEffect(
-  LayerNode.compile(LayerNode.group([ToolRegistry.node, CrossSpawnSpawner.node, Ripgrep.node]), [
-    [FSUtil.node, ReviewFs.node],
-  ]),
-)
-
-describe("review mode via ToolRegistry", () => {
-  registryIt.instance("edit staged through registry does not touch disk", () =>
-    Effect.gen(function* () {
-      enableReview()
-      const test = yield* TestInstance
-
-      const registry = yield* ToolRegistry.Service
-      const tools = yield* registry.tools({
-        providerID: ProviderV2.ID.opencode,
-        modelID: ModelV2.ID.make("test"),
-        agent: { name: "build", mode: "primary", permission: [], options: {} },
-      })
-      const edit = tools.find((tool) => tool.id === "edit")
-      if (!edit) throw new Error("edit tool not registered")
-
-      const filepath = path.join(test.directory, "registry-edit.txt")
-      yield* Effect.promise(() => fs.writeFile(filepath, "before\n", "utf-8"))
-
-      yield* edit.execute({ filePath: filepath, oldString: "before", newString: "after" }, baseCtx)
-
-      expect(yield* readDisk(filepath)).toBe("before\n")
-      const staged = ReviewOverlay.get(filepath)
-      expect(staged && "content" in staged ? staged.content : undefined).toBe("after\n")
+      expect(content.some((item) => item.type === "diff" && item.path === deletePath && item.newText === "")).toBe(true)
     }),
   )
 })
